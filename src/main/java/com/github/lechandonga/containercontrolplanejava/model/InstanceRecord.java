@@ -17,14 +17,20 @@ public class InstanceRecord {
 
     public InstanceRecord(String id, String workloadUid, String nodeUid, String image,
                           long generation, InstanceState state) {
+        this(id, workloadUid, nodeUid, image, generation, state, 0, Instant.now());
+    }
+
+    /** 进程重启恢复时使用：restartCount 与 createdAt 按落盘值还原。 */
+    public InstanceRecord(String id, String workloadUid, String nodeUid, String image,
+                          long generation, InstanceState state, int restartCount, Instant createdAt) {
         this.id = id;
         this.workloadUid = workloadUid;
         this.nodeUid = nodeUid;
         this.image = image;
         this.generation = generation;
         this.state = state;
-        this.restartCount = 0;
-        this.createdAt = Instant.now();
+        this.restartCount = restartCount;
+        this.createdAt = createdAt;
     }
 
     public String getId() { return id; }

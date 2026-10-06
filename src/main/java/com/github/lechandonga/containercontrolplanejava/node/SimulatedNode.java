@@ -51,6 +51,20 @@ public class SimulatedNode {
         return partitioned || (failingImage != null && failingImage.equals(image));
     }
 
+    /** 快照用：被注入的失败镜像（partition 状态单独持久化）。 */
+    public String failingImageForSnapshot() {
+        return failingImage;
+    }
+
+    /** 进程重启恢复：按磁盘上的权威视图还原分区/失败注入/容器投影。 */
+    public synchronized void restoreFromSnapshot(boolean partitioned, String failingImage,
+                                                 Map<String, String> containers) {
+        this.partitioned = partitioned;
+        this.failingImage = failingImage;
+        this.runningContainers.clear();
+        this.runningContainers.putAll(containers);
+    }
+
     /**
      * 在节点上启动容器。幂等：同一 instanceId 重复调用不会叠加计数。
      *

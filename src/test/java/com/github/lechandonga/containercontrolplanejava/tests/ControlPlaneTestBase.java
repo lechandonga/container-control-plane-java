@@ -2,9 +2,11 @@ package com.github.lechandonga.containercontrolplanejava.tests;
 
 import com.github.lechandonga.containercontrolplanejava.api.ControlPlaneService;
 import com.github.lechandonga.containercontrolplanejava.event.EventLog;
+import com.github.lechandonga.containercontrolplanejava.persistence.LocalStateStore;
 import com.github.lechandonga.containercontrolplanejava.model.InstanceState;
 import com.github.lechandonga.containercontrolplanejava.model.Workload;
 import com.github.lechandonga.containercontrolplanejava.model.WorkloadPhase;
+import com.github.lechandonga.containercontrolplanejava.revision.RevisionLog;
 import com.github.lechandonga.containercontrolplanejava.node.SimulatedNode;
 import com.github.lechandonga.containercontrolplanejava.reconcile.Reconciler;
 import com.github.lechandonga.containercontrolplanejava.scheduler.Scheduler;
@@ -19,6 +21,7 @@ import org.springframework.test.context.TestPropertySource;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.nio.file.Path;
 import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,7 +37,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestPropertySource(properties = {
         "controlplane.reconcile-interval-ms=3600000",
         "controlplane.heartbeat-interval-ms=3600000",
-        "controlplane.heartbeat-timeout-seconds=100"
+        "controlplane.heartbeat-timeout-seconds=100",
+        "controlplane.state-dir=target/test-control-plane-state"
 })
 public abstract class ControlPlaneTestBase {
 
@@ -47,13 +51,36 @@ public abstract class ControlPlaneTestBase {
     @Autowired protected Reconciler reconciler;
     @Autowired protected EventLog eventLog;
     @Autowired protected ClockService clockService;
+    @Autowired protected RevisionLog revisionLog;
+    @Autowired protected LocalStateStore localStateStore;
 
     @BeforeEach
     void resetWorld() {
         store.resetForTests();
         nodeRegistry.resetForTests();
         eventLog.resetForTests();
+        revisionLog.resetForTests();
+        localStateStore.deleteStateFileForTests();
         clockService.setClock(Clock.fixed(T0, ZoneOffset.UTC));
+    }
+
+    /** 模拟整个控制面进程重启：从磁盘状态文件恢复权威状态后继续调谐。 */
+    protected void restartProcess() {
+        service.restartControlPlane();
+    }
+
+    /** 模拟“写到一半被强杀”：下次状态落盘在原子替换前中断，正式状态文件保持变更前内容。 */
+    protected void crashDuringNextStateWrite() {
+        localStateStore.injectCrashBeforeAtomicSwap();
+    }
+
+    protected Path stateFile() {
+        return localStateStore.stateFileForTests();
+    }
+
+    /** 直接破坏正式状态文件内容，模拟磁盘损坏/被截断。 */
+    protected void corruptStateFile(String garbage) {
+        localStateStore.corruptStateFileForTests(garbage);
     }
 
     protected SimulatedNode node(int capacity) {

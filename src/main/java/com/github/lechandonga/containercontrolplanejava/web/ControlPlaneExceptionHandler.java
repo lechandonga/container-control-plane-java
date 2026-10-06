@@ -2,6 +2,7 @@ package com.github.lechandonga.containercontrolplanejava.web;
 
 import com.github.lechandonga.containercontrolplanejava.event.EventLog;
 import com.github.lechandonga.containercontrolplanejava.store.ConflictException;
+import com.github.lechandonga.containercontrolplanejava.store.InvalidRollbackException;
 import com.github.lechandonga.containercontrolplanejava.store.NotFoundException;
 import com.github.lechandonga.containercontrolplanejava.web.dto.ErrorView;
 import org.springframework.http.HttpStatus;
@@ -44,5 +45,11 @@ public class ControlPlaneExceptionHandler {
     public ResponseEntity<ErrorView> badRequest(IllegalArgumentException ex) {
         return ResponseEntity.badRequest()
                 .body(new ErrorView("INVALID_SPEC", ex.getMessage(), null, null, null));
+    }
+
+    @ExceptionHandler(InvalidRollbackException.class)
+    public ResponseEntity<ErrorView> invalidRollback(InvalidRollbackException ex) {
+        return ResponseEntity.badRequest()
+                .body(new ErrorView("INVALID_ROLLBACK", ex.getMessage(), null, null, null));
     }
 }

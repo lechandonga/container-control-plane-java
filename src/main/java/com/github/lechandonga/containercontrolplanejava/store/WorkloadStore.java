@@ -4,6 +4,9 @@ import com.github.lechandonga.containercontrolplanejava.model.InstanceRecord;
 import com.github.lechandonga.containercontrolplanejava.model.Workload;
 import com.github.lechandonga.containercontrolplanejava.model.WorkloadPhase;
 import com.github.lechandonga.containercontrolplanejava.model.WorkloadSpec;
+import com.github.lechandonga.containercontrolplanejava.revision.Revision;
+import com.github.lechandonga.containercontrolplanejava.revision.RevisionLog;
+import com.github.lechandonga.containercontrolplanejava.revision.RevisionTrigger;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -31,7 +34,13 @@ public class WorkloadStore {
     private final ConcurrentHashMap<String, Workload> workloads = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, InstanceRecord> instances = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> workloadLocks = new ConcurrentHashMap<>();
-    private final AtomicLong rvSeq = new AtomicLong();
+    private final AtomicLong rvSeq;
+    private final RevisionLog revisionLog;
+
+    public WorkloadStore(RevisionLog revisionLog) {
+        this.revisionLog = revisionLog;
+        this.rvSeq = new AtomicLong();
+    }
 
     private String nextResourceVersion() {
         return "rv-" + rvSeq.incrementAndGet();
@@ -52,6 +61,9 @@ public class WorkloadStore {
         if (existing != null) {
             throw new ConflictException(uid, "<absent>", existing.getResourceVersion());
         }
+        Revision revision = revisionLog.append(uid, created.getGeneration(),
+                RevisionTrigger.CREATE, null, null, spec);
+        created.setActiveRevisionNo(revision.getRevision());
         return created;
     }
 
@@ -90,6 +102,7 @@ public class WorkloadStore {
                     || !expectedResourceVersion.equals(wl.getResourceVersion())) {
                 throw new ConflictException(uid, expectedResourceVersion, wl.getResourceVersion());
             }
+            WorkloadSpec oldSpec = wl.getSpec();
             wl.setSpec(newSpec);
             wl.setGeneration(wl.getGeneration() + 1);
             wl.setResourceVersion(nextResourceVersion());
@@ -98,6 +111,66 @@ public class WorkloadStore {
             wl.setRolloutDeadline(null);
             wl.setUpdatePhase(com.github.lechandonga.containercontrolplanejava.model.UpdatePhase.IDLE);
             wl.clearRollbackTarget();
+            wl.setUserRollback(false);
+            wl.setCleanupNonTarget(false);
+            wl.setSupersededRevisionNo(null);
+            Revision revision = revisionLog.append(uid, wl.getGeneration(),
+                    RevisionTrigger.UPDATE, null, oldSpec, newSpec);
+            wl.setActiveRevisionNo(revision.getRevision());
+            return new SubmitResult(wl, true);
+        }
+    }
+
+    /**
+     * 按修订回滚。并发保护与普通更新完全一致（必须携带当前 resourceVersion），
+     * 被拒/重复提交同样不产生历史。回滚本身是一条新的 {@link RevisionTrigger#ROLLBACK} 修订，
+     * 目标声明取自历史修订（副本数与版本），不覆盖任何旧历史。
+     *
+     * @param targetRevisionNo 目标修订号；null 表示“退回上一个修订”
+     */
+    public SubmitResult rollback(String uid, Long targetRevisionNo, String expectedResourceVersion) {
+        synchronized (lockFor(uid)) {
+            Workload wl = get(uid);
+            List<Revision> history = revisionLog.list(uid);
+            if (history.isEmpty()) {
+                throw new InvalidRollbackException(
+                        "工作负载 " + uid + " 没有任何发布历史，无法回滚");
+            }
+            Revision target;
+            if (targetRevisionNo == null) {
+                // “退回上一个修订”：最近一条历史修订之前的那条；若只有一条，则回到其声明。
+                target = history.size() >= 2
+                        ? history.get(history.size() - 2) : history.get(0);
+            } else {
+                target = revisionLog.get(uid, targetRevisionNo)
+                        .orElseThrow(() -> new InvalidRollbackException(
+                                "修订 " + targetRevisionNo + " 不存在于工作负载 " + uid + " 的发布历史"));
+            }
+            WorkloadSpec targetSpec = target.getAfterSpec();
+            if (Objects.equals(targetSpec, wl.getSpec())) {
+                // 声明与当前完全一致：幂等空操作，不写历史、不换版本。
+                return new SubmitResult(wl, false);
+            }
+            if (expectedResourceVersion == null
+                    || !expectedResourceVersion.equals(wl.getResourceVersion())) {
+                throw new ConflictException(uid, expectedResourceVersion, wl.getResourceVersion());
+            }
+            WorkloadSpec oldSpec = wl.getSpec();
+            Long superseded = wl.getActiveRevisionNo();
+            wl.setSpec(targetSpec);
+            wl.setGeneration(wl.getGeneration() + 1);
+            wl.setResourceVersion(nextResourceVersion());
+            wl.setRolloutAttempts(0);
+            wl.setRolloutDeadline(null);
+            wl.setUpdatePhase(com.github.lechandonga.containercontrolplanejava.model.UpdatePhase.IDLE);
+            wl.clearRollbackTarget();
+            wl.setRolloutFailureReason(null);
+            wl.setUserRollback(true);
+            wl.setCleanupNonTarget(false);
+            wl.setSupersededRevisionNo(superseded);
+            Revision revision = revisionLog.append(uid, wl.getGeneration(),
+                    RevisionTrigger.ROLLBACK, target.getRevision(), oldSpec, targetSpec);
+            wl.setActiveRevisionNo(revision.getRevision());
             return new SubmitResult(wl, true);
         }
     }
@@ -121,6 +194,7 @@ public class WorkloadStore {
     public void purge(String uid) {
         workloads.remove(uid);
         workloadLocks.remove(uid);
+        revisionLog.purge(uid);
     }
 
     public InstanceRecord putInstance(InstanceRecord record) {
@@ -166,6 +240,7 @@ public class WorkloadStore {
         workloads.clear();
         instances.clear();
         workloadLocks.clear();
+        rvSeq.set(0);
     }
 
     /** 调谐器在临界区内修改聚合状态后换发 resourceVersion（观察状态变化同样需要可见性版本）。 */
@@ -174,4 +249,27 @@ public class WorkloadStore {
     }
 
     public record SubmitResult(Workload workload, boolean changed) {}
+
+    // ===== 进程重启恢复 =====
+
+    /** 仅供持久层使用：当前 resourceVersion 序列值。 */
+    public long rvSequenceForSnapshot() {
+        return rvSeq.get();
+    }
+
+    /** 进程重启后按磁盘快照整体恢复权威状态（锁对象重新建立）。 */
+    public void restoreFromSnapshot(long rvSequence, List<Workload> restoredWorkloads,
+                                    List<InstanceRecord> restoredInstances) {
+        workloads.clear();
+        instances.clear();
+        workloadLocks.clear();
+        rvSeq.set(rvSequence);
+        for (Workload wl : restoredWorkloads) {
+            workloads.put(wl.getUid(), wl);
+            workloadLocks.put(wl.getUid(), new Object());
+        }
+        for (InstanceRecord r : restoredInstances) {
+            instances.put(r.getId(), r);
+        }
+    }
 }

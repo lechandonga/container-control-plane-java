@@ -45,6 +45,24 @@ public class NodeRegistry {
         return new ArrayList<>(nodes.values());
     }
 
+    /** 进程重启恢复：整体替换为磁盘上的节点视图（uid 与序号保持稳定）。 */
+    public void restoreFromSnapshot(List<SimulatedNode> restored) {
+        long maxSeq = 0;
+        nodes.clear();
+        for (SimulatedNode node : restored) {
+            nodes.put(node.getInfo().getUid(), node);
+            String uid = node.getInfo().getUid();
+            if (uid.startsWith("node-")) {
+                try {
+                    maxSeq = Math.max(maxSeq, Long.parseLong(uid.substring("node-".length())));
+                } catch (NumberFormatException ignored) {
+                    // 非标准 uid 不参与序号推导。
+                }
+            }
+        }
+        seq.set(maxSeq);
+    }
+
     /** 仅供测试隔离使用：清空全部节点。 */
     public void resetForTests() {
         nodes.clear();

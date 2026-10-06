@@ -26,6 +26,14 @@ public class Workload {
     private volatile long rollbackTargetGeneration;
     /** 触发本次失败回退的原因码（启动失败/超时），回退完成时用于终态告停。 */
     private volatile String rolloutFailureReason;
+    /** 用户显式“按修订回滚”时为 true：目标版本失败不得再退回其他版本，只能清理混跑并告停。 */
+    private volatile boolean userRollback;
+    /** 当前正在收敛的修订序号；修订终态据此标记成功/失败/被回退。 */
+    private volatile Long activeRevisionNo;
+    /** 用户回滚成功后应标记为 ROLLED_BACK 的被取代修订（回滚前的活动修订）。 */
+    private volatile Long supersededRevisionNo;
+    /** 用户回滚失败的告停清理：逐轮移除所有非目标版本实例，清完后置终态 FAILED。 */
+    private volatile boolean cleanupNonTarget;
     private final List<Condition> conditions = new ArrayList<>();
 
     public Workload(String uid, WorkloadSpec spec, long generation, String resourceVersion) {
@@ -69,12 +77,26 @@ public class Workload {
     public void clearRollbackTarget() { this.rollbackTargetImage = null; }
     public String getRolloutFailureReason() { return rolloutFailureReason; }
     public void setRolloutFailureReason(String reason) { this.rolloutFailureReason = reason; }
+    public boolean isUserRollback() { return userRollback; }
+    public void setUserRollback(boolean userRollback) { this.userRollback = userRollback; }
+    public Long getActiveRevisionNo() { return activeRevisionNo; }
+    public void setActiveRevisionNo(Long revisionNo) { this.activeRevisionNo = revisionNo; }
+    public Long getSupersededRevisionNo() { return supersededRevisionNo; }
+    public void setSupersededRevisionNo(Long revisionNo) { this.supersededRevisionNo = revisionNo; }
+    public boolean isCleanupNonTarget() { return cleanupNonTarget; }
+    public void setCleanupNonTarget(boolean cleanupNonTarget) { this.cleanupNonTarget = cleanupNonTarget; }
     public List<Condition> getConditions() {
         synchronized (conditions) { return new ArrayList<>(conditions); }
     }
     public void addCondition(Condition c) {
         synchronized (conditions) {
             conditions.removeIf(existing -> existing.type().equals(c.type()));
+            conditions.add(c);
+        }
+    }
+    /** 重启恢复时按原样装回条件（保留原始时间戳）。 */
+    public void restoreCondition(Condition c) {
+        synchronized (conditions) {
             conditions.add(c);
         }
     }
