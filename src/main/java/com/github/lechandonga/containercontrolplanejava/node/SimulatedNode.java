@@ -94,4 +94,12 @@ public class SimulatedNode {
     public synchronized void wipeAll() {
         runningContainers.clear();
     }
+
+    /** 仅供进程重启恢复：重建节点本地容器投影（与权威实例记录对账，不产生重复动作）。 */
+    public synchronized void restoreContainers(Map<String, String> containers) {
+        runningContainers.clear();
+        if (containers != null) {
+            runningContainers.putAll(containers);
+        }
+    }
 }

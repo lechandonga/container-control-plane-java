@@ -41,6 +41,13 @@ public class AdminController {
         return Map.of("result", "RECONCILED_FROM_STORE");
     }
 
+    /** 演示/测试用：模拟真实进程重启——内存状态全丢，仅从本地磁盘文件恢复并继续收敛。 */
+    @PostMapping("/restart-process")
+    public Map<String, String> restartProcess() {
+        service.restartProcessFromDisk();
+        return Map.of("result", "RESTORED_FROM_LOCAL_DISK_AND_RECONCILED");
+    }
+
     @GetMapping("/events")
     public List<EventView> events(@RequestParam(required = false) String business) {
         return eventLog.all().stream()

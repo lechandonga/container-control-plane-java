@@ -5,6 +5,8 @@ import com.github.lechandonga.containercontrolplanejava.model.Condition;
 import com.github.lechandonga.containercontrolplanejava.model.InstanceRecord;
 import com.github.lechandonga.containercontrolplanejava.model.InstanceState;
 import com.github.lechandonga.containercontrolplanejava.model.NodeState;
+import com.github.lechandonga.containercontrolplanejava.model.Revision;
+import com.github.lechandonga.containercontrolplanejava.model.RevisionStatus;
 import com.github.lechandonga.containercontrolplanejava.model.UpdatePhase;
 import com.github.lechandonga.containercontrolplanejava.model.Workload;
 import com.github.lechandonga.containercontrolplanejava.model.WorkloadPhase;
@@ -75,9 +77,15 @@ public class Reconciler {
     /** 对单个工作负载执行一轮调谐；事件/循环/提交可任意重复调用，结果幂等。 */
     public void reconcile(String workloadUid) {
         synchronized (store.lockFor(workloadUid)) {
-            Workload workload = store.find(workloadUid).orElse(null);
-            if (workload != null) {
-                reconcileLocked(workload);
+            try {
+                Workload workload = store.find(workloadUid).orElse(null);
+                if (workload != null) {
+                    reconcileLocked(workload);
+                }
+            } finally {
+                // 每一轮观察-决策-执行结束后原子落盘：进程任意时刻被强杀，
+                // 磁盘上都是本轮之前或之后的完整快照之一。
+                store.fireStateChange();
             }
         }
     }
@@ -122,16 +130,8 @@ public class Reconciler {
             return;
         }
 
-        // 5) 已告停的更新（FAILED 终态）：停止推进新版本，仅保留上面的稳态自愈。
-        if (wl.getUpdatePhase() == UpdatePhase.FAILED
-                && wl.getObservedGeneration() == wl.getGeneration()) {
-            wl.setPhase(WorkloadPhase.FAILED);
-            refreshStatus(wl);
-            store.bumpResourceVersion(wl);
-            return;
-        }
-
-        // 6) 失败回退阶段：把实际状态恢复到上一个良好版本并补齐副本数。
+        // 5) 普通更新的失败回退阶段：把实际状态恢复到上一个良好版本并补齐副本数。
+        //    （显式按修订回滚不走这里——它失败时必须清退所有非目标版本，由滚动分支硬终止。）
         if (wl.getRollbackTargetImage() != null) {
             if (handleRollback(wl, store.instancesOf(wl.getUid()))) {
                 refreshStatus(wl);
@@ -140,15 +140,26 @@ public class Reconciler {
             return;
         }
 
-        // 7) 滚动更新。
-        if (wl.getUpdatePhase() == UpdatePhase.ROLLING) {
+        // 6) 滚动更新（含显式回滚）：ROLLING 中正常推进；显式回滚告停后继续在
+        //    滚动分支内做“只减不增”的非目标版本硬终止清退。
+        if (wl.getUpdatePhase() == UpdatePhase.ROLLING
+                || (isExplicitRollback(wl) && wl.getUpdatePhase() == UpdatePhase.FAILED)) {
             handleRollout(wl, store.instancesOf(wl.getUid()));
             refreshStatus(wl);
             store.bumpResourceVersion(wl);
             return;
         }
 
-        // 7) 稳态扩缩容。
+        // 7) 已告停的普通更新（FAILED 终态）：停止推进新版本，仅保留上面的稳态自愈。
+        if (wl.getUpdatePhase() == UpdatePhase.FAILED
+                && wl.getObservedGeneration() == wl.getGeneration()) {
+            wl.setPhase(WorkloadPhase.FAILED);
+            refreshStatus(wl);
+            store.bumpResourceVersion(wl);
+            return;
+        }
+
+        // 8) 稳态扩缩容。
         if (handleSteadyScaling(wl, store.instancesOf(wl.getUid()))) {
             refreshStatus(wl);
             store.bumpResourceVersion(wl);
@@ -167,6 +178,8 @@ public class Reconciler {
                             + " image=" + wl.getSpec().image());
             store.bumpResourceVersion(wl);
         }
+        // 稳态收敛（含纯扩缩容、首轮部署即匹配）：当前修订如实标记为成功。终态只写一次。
+        store.completeHeadRevision(wl, RevisionStatus.SUCCEEDED, REASON_CONVERGED);
     }
 
     private void beginRollout(Workload wl) {
@@ -225,9 +238,15 @@ public class Reconciler {
                 return true;
             }
             if (record.getState() == InstanceState.START_FAILED) {
+                // 已告停的失败现场保持原样：不再反复摘除重投（除非人工重新提交期望）。
+                if (wl.getUpdatePhase() == UpdatePhase.FAILED) {
+                    continue;
+                }
                 boolean desiredVersion = record.getImage().equals(wl.getSpec().image());
                 stopAndRemove(record);
-                if (desiredVersion && wl.getUpdatePhase() == UpdatePhase.ROLLING) {
+                if (desiredVersion
+                        && (wl.getUpdatePhase() == UpdatePhase.ROLLING
+                        || wl.getUpdatePhase() == UpdatePhase.FAILED)) {
                     wl.setRolloutAttempts(wl.getRolloutAttempts() + 1);
                 }
                 eventLog.record(EventLog.BUSINESS_RECONCILE, wl.getUid(), "StartFailedRecordEvicted",
@@ -305,6 +324,41 @@ public class Reconciler {
                 oldRecords.add(r);
             }
         }
+
+        // 显式回滚硬终止：目标版本确认起不来后，非目标版本只减不增，一轮一个彻底清退，
+        // 可用性下限不再保护“错误版本”的可用性——绝不允许两个版本同时对外服务。
+        if (isExplicitRollback(wl) && wl.getUpdatePhase() == UpdatePhase.FAILED) {
+            InstanceRecord nonTarget = records.stream()
+                    .filter(r -> !r.getImage().equals(desiredImage)
+                            && r.getState() != InstanceState.LOST)
+                    .sorted(Comparator.comparing(InstanceRecord::getId))
+                    .findFirst().orElse(null);
+            if (nonTarget != null) {
+                stopAndRemove(nonTarget);
+                eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(),
+                        "RollbackDrainNonTarget",
+                        "回滚目标版本不可用，硬终止清退非目标实例 " + nonTarget.getId()
+                                + "（image=" + nonTarget.getImage() + "），禁止双版本对外服务");
+                return;
+            }
+            // 非目标已清零：摘除目标版本残留的启动失败记录，如实呈现零实例现场（不再重投）。
+            InstanceRecord failedTarget = newRecords.stream()
+                    .filter(r -> r.getState() == InstanceState.START_FAILED)
+                    .sorted(Comparator.comparing(InstanceRecord::getId))
+                    .findFirst().orElse(null);
+            if (failedTarget != null) {
+                stopAndRemove(failedTarget);
+                eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(),
+                        "RollbackEvictDeadTarget",
+                        "目标版本实例 " + failedTarget.getId()
+                                + " 启动失败，摘除并保持零实例告停");
+                return;
+            }
+            // 非目标实例已清零：按目标版本的真实可得性给出最终现场，不再反复尝试新版本。
+            settleHardRollbackFailure(wl, newRecords, failureReasonOr(wl, REASON_ROLLOUT_FAILED));
+            return;
+        }
+
         long newReady = newRecords.stream().filter(this::isRunningHealthy).count();
         long available = records.stream().filter(this::isRunningHealthy).count();
         long liveCount = records.stream().filter(r -> r.getState() != InstanceState.LOST).count();
@@ -318,12 +372,20 @@ public class Reconciler {
                             + " 个新版本实例全部就绪，旧版本已彻底清理", gen));
             eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(), REASON_ROLLOUT_OK,
                     "image=" + desiredImage + " ready=" + desired);
+            store.completeHeadRevision(wl, RevisionStatus.SUCCEEDED, REASON_ROLLOUT_OK);
             return;
         }
 
         String failure = rolloutFailureReason(wl);
         if (failure != null) {
             wl.setRolloutFailureReason(reasonCode(failure));
+            if (isExplicitRollback(wl)) {
+                // 显式回滚走的虽然是同一条滚动通道，但失败语义不同：
+                // 不允许回到任何非目标版本继续服务——逐轮清空非目标实例，
+                // 随后按目标版本的真实可得性精确收敛；目标版本起不来就零实例告停。
+                abortHardRollback(wl, records, desiredImage, failure);
+                return;
+            }
             abortRollout(wl, newRecords, oldRecords, failure);
             return;
         }
@@ -474,6 +536,7 @@ public class Reconciler {
             wl.addCondition(Condition.of("Rollout", false, code,
                     "版本 " + wl.getSpec().image() + " 部署失败且不存在可回退的旧版本。原因："
                             + reason + "。请修正镜像/容量后重新提交期望状态。", wl.getGeneration()));
+            store.completeHeadRevision(wl, RevisionStatus.FAILED, code);
             eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(), REASON_ROLLOUT_FAILED,
                     reason + "（无旧版本可回退，直接告停）");
             return;
@@ -512,6 +575,7 @@ public class Reconciler {
                     "滚动更新失败（" + code + "），已回退到旧版本 " + targetImage + "，" + desired
                             + " 个旧版本实例全部就绪，新版本已彻底清理，系统继续以旧版本提供服务。"
                             + "请修正后重新提交。", wl.getGeneration()));
+            store.completeHeadRevision(wl, RevisionStatus.FAILED, code);
             eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(), "RollbackCompleted",
                     "回退完成，服务运行于旧版本 " + targetImage + "，ready=" + desired
                             + "，失败原因=" + code);
@@ -605,5 +669,77 @@ public class Reconciler {
                 .count();
         wl.setReadyReplicas(ready);
         wl.setUpdatedReadyReplicas(updatedReady);
+    }
+
+    // ===== 显式按修订回滚的硬终止语义 =====
+
+    /** 当前期望对应的修订是一条显式 ROLLBACK 修订。 */
+    private boolean isExplicitRollback(Workload wl) {
+        Revision head = wl.headRevision();
+        return head != null && head.getKind()
+                == com.github.lechandonga.containercontrolplanejava.model.RevisionKind.ROLLBACK;
+    }
+
+    private String failureReasonOr(Workload wl, String fallback) {
+        return wl.getRolloutFailureReason() != null ? wl.getRolloutFailureReason() : fallback;
+    }
+
+    /**
+     * 显式回滚失败时的处理入口：立即置 FAILED 终态并锁定修订终态，
+     * 随后的每一轮由 {@code handleRollout} 的硬终止分支只减不增地清退全部非目标实例。
+     * 与普通更新失败“自动回退继续服务”不同，这里绝不允许非目标版本继续对外服务。
+     */
+    private void abortHardRollback(Workload wl, List<InstanceRecord> records,
+                                   String targetImage, String reason) {
+        String code = reasonCode(reason);
+        wl.setUpdatePhase(UpdatePhase.FAILED);
+        wl.setPhase(WorkloadPhase.FAILED);
+        wl.setRolloutFailureReason(code);
+        wl.addCondition(Condition.of("Rollout", false, code,
+                "回滚到目标版本 " + targetImage + " 失败（" + reason
+                        + "）。正在只减不增地清退全部非目标版本实例：既不能停留在错误版本，"
+                        + "也不允许两个版本同时对外服务；清退后若目标版本仍不可用，将零实例告停。",
+                wl.getGeneration()));
+        store.completeHeadRevision(wl, RevisionStatus.FAILED, code);
+        eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(), "RollbackFailedAbort",
+                "回滚目标 " + targetImage + " 不可用: " + reason + "，开始硬终止清退非目标实例");
+    }
+
+    /**
+     * 非目标实例清零后的最终现场：
+     * <ul>
+     *   <li>目标版本恰好就绪到期望副本数 → 不可能出现在 FAILED 分支（成功分支已先行收敛）；</li>
+     *   <li>目标版本起不来/容量不够 → 保持 FAILED，实际实例数只少不多，
+     *       条件如实写明“容量或健康节点不足/镜像无法启动”，不会静默重试。</li>
+     * </ul>
+     */
+    private void settleHardRollbackFailure(Workload wl, List<InstanceRecord> targetRecords,
+                                           String code) {
+        long targetReady = targetRecords.stream().filter(this::isRunningHealthy).count();
+        int desired = wl.getSpec().replicas();
+        if (targetReady >= desired) {
+            // 目标版本在清退过程中恢复就绪：精确收敛为单版本成功。
+            wl.setUpdatePhase(UpdatePhase.SUCCEEDED);
+            wl.setPhase(WorkloadPhase.RUNNING);
+            wl.setRolloutFailureReason(null);
+            wl.addCondition(Condition.of("Rollout", true, REASON_ROLLOUT_OK,
+                    "回滚目标版本 " + wl.getSpec().image() + " 最终就绪，单版本精确收敛到 "
+                            + desired + " 副本", wl.getGeneration()));
+            store.completeHeadRevision(wl, RevisionStatus.SUCCEEDED, REASON_ROLLOUT_OK);
+            eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(), REASON_ROLLOUT_OK,
+                    "回滚在硬终止清退后目标版本恢复，已单版本收敛");
+            return;
+        }
+        SchedulingDecision decision = scheduler.schedule();
+        String detail = targetReady == 0
+                ? "目标版本实例无法在健康节点上启动/运行（镜像启动失败或无健康节点）"
+                : "目标版本仅就绪 " + targetReady + "/" + desired
+                        + "，剩余健康节点容量不足以补齐（" + decision.reason() + "）";
+        wl.addCondition(Condition.of("Rollout", false, code,
+                "回滚告停：非目标版本已全部清退，不存在两版本混跑；" + detail
+                        + "。系统保持 FAILED，不会自行重试，请重新提交期望状态。",
+                wl.getGeneration()));
+        eventLog.record(EventLog.BUSINESS_ROLLING_UPDATE, wl.getUid(), "RollbackStopped",
+                "回滚终态告停: " + detail + "，非目标实例残留=0，targetReady=" + targetReady);
     }
 }

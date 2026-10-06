@@ -6,6 +6,7 @@ import com.github.lechandonga.containercontrolplanejava.model.InstanceState;
 import com.github.lechandonga.containercontrolplanejava.model.Workload;
 import com.github.lechandonga.containercontrolplanejava.model.WorkloadPhase;
 import com.github.lechandonga.containercontrolplanejava.node.SimulatedNode;
+import com.github.lechandonga.containercontrolplanejava.persist.LocalStateStore;
 import com.github.lechandonga.containercontrolplanejava.reconcile.Reconciler;
 import com.github.lechandonga.containercontrolplanejava.scheduler.Scheduler;
 import com.github.lechandonga.containercontrolplanejava.store.WorkloadStore;
@@ -19,6 +20,9 @@ import org.springframework.test.context.TestPropertySource;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,7 +38,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestPropertySource(properties = {
         "controlplane.reconcile-interval-ms=3600000",
         "controlplane.heartbeat-interval-ms=3600000",
-        "controlplane.heartbeat-timeout-seconds=100"
+        "controlplane.heartbeat-timeout-seconds=100",
+        "controlplane.state-dir=target/test-state"
 })
 public abstract class ControlPlaneTestBase {
 
@@ -47,13 +52,35 @@ public abstract class ControlPlaneTestBase {
     @Autowired protected Reconciler reconciler;
     @Autowired protected EventLog eventLog;
     @Autowired protected ClockService clockService;
+    @Autowired protected LocalStateStore localStateStore;
 
     @BeforeEach
     void resetWorld() {
+        wipeStateDir();
         store.resetForTests();
         nodeRegistry.resetForTests();
         eventLog.resetForTests();
         clockService.setClock(Clock.fixed(T0, ZoneOffset.UTC));
+        // 清空磁盘后让持久化层重新引导（以空状态启动），保证用例之间零串扰。
+        localStateStore.bootstrap();
+    }
+
+    private static void wipeStateDir() {
+        Path dir = Path.of("target/test-state");
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try (var paths = Files.walk(dir)) {
+            paths.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     protected SimulatedNode node(int capacity) {
@@ -144,5 +171,15 @@ public abstract class ControlPlaneTestBase {
             }
         }
         assertTrue(false, message + " | 最终状态: " + describe(uid));
+    }
+
+    /** 模拟“进程停掉再拉起”：内存权威状态全丢，仅靠本地磁盘文件恢复，然后从中断处继续。 */
+    protected void restartProcess() {
+        service.restartProcessFromDisk();
+    }
+
+    /** 下次落盘时模拟强杀（只写半份临时文件、不执行原子替换）。 */
+    protected void armKillDuringWrite() {
+        service.armKillDuringNextWrite();
     }
 }

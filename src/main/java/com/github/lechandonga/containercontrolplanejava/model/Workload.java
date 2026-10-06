@@ -27,6 +27,8 @@ public class Workload {
     /** 触发本次失败回退的原因码（启动失败/超时），回退完成时用于终态告停。 */
     private volatile String rolloutFailureReason;
     private final List<Condition> conditions = new ArrayList<>();
+    /** 发布历史：仅追加（append-only），随聚合删除而消失，任何后续操作不得改写已形成的终态。 */
+    private final List<Revision> revisions = new ArrayList<>();
 
     public Workload(String uid, WorkloadSpec spec, long generation, String resourceVersion) {
         this.uid = uid;
@@ -76,6 +78,62 @@ public class Workload {
         synchronized (conditions) {
             conditions.removeIf(existing -> existing.type().equals(c.type()));
             conditions.add(c);
+        }
+    }
+
+    // ===== 发布历史 =====
+
+    /** 追加一条新修订（调用方已持有该工作负载的调谐锁）。 */
+    public void addRevision(Revision revision) {
+        synchronized (revisions) {
+            revisions.add(revision);
+        }
+    }
+
+    public List<Revision> getRevisions() {
+        synchronized (revisions) {
+            return new ArrayList<>(revisions);
+        }
+    }
+
+    public Revision findRevision(long revisionNumber) {
+        synchronized (revisions) {
+            for (Revision r : revisions) {
+                if (r.getRevision() == revisionNumber) {
+                    return r;
+                }
+            }
+            return null;
+        }
+    }
+
+    /** 当前期望（generation）对应的修订，即历史链头。 */
+    public Revision headRevision() {
+        synchronized (revisions) {
+            return revisions.isEmpty() ? null : revisions.get(revisions.size() - 1);
+        }
+    }
+
+    /** “上一个修订”：修订号严格小于当前 generation 的最大一条。 */
+    public Revision previousRevision() {
+        synchronized (revisions) {
+            int size = revisions.size();
+            return size >= 2 ? revisions.get(size - 2) : null;
+        }
+    }
+
+    /** 仅供进程重启恢复时重建历史使用（按修订号升序调用）。 */
+    public void restoreRevision(Revision revision) {
+        synchronized (revisions) {
+            revisions.add(revision);
+        }
+    }
+
+    /** 仅供进程重启恢复时重建条件列表使用。 */
+    public void restoreConditions(List<Condition> snapshot) {
+        synchronized (conditions) {
+            conditions.clear();
+            conditions.addAll(snapshot);
         }
     }
 }

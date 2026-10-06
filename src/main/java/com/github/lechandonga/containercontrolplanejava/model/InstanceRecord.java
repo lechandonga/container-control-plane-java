@@ -27,6 +27,20 @@ public class InstanceRecord {
         this.createdAt = Instant.now();
     }
 
+    /** 仅供进程重启恢复时重建权威实例记录（保留原创建时间与重启计数）。 */
+    public InstanceRecord(String id, String workloadUid, String nodeUid, String image,
+                          long generation, InstanceState state, int restartCount,
+                          Instant createdAt) {
+        this.id = id;
+        this.workloadUid = workloadUid;
+        this.nodeUid = nodeUid;
+        this.image = image;
+        this.generation = generation;
+        this.state = state;
+        this.restartCount = restartCount;
+        this.createdAt = createdAt;
+    }
+
     public String getId() { return id; }
     public String getWorkloadUid() { return workloadUid; }
     public String getNodeUid() { return nodeUid; }

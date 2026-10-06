@@ -2,10 +2,13 @@ package com.github.lechandonga.containercontrolplanejava.api;
 
 import com.github.lechandonga.containercontrolplanejava.control.ControlLoop;
 import com.github.lechandonga.containercontrolplanejava.event.EventLog;
+import com.github.lechandonga.containercontrolplanejava.model.Revision;
+import com.github.lechandonga.containercontrolplanejava.model.RevisionStatus;
 import com.github.lechandonga.containercontrolplanejava.model.Workload;
 import com.github.lechandonga.containercontrolplanejava.model.WorkloadSpec;
 import com.github.lechandonga.containercontrolplanejava.node.NodeRegistry;
 import com.github.lechandonga.containercontrolplanejava.node.SimulatedNode;
+import com.github.lechandonga.containercontrolplanejava.persist.LocalStateStore;
 import com.github.lechandonga.containercontrolplanejava.reconcile.Reconciler;
 import com.github.lechandonga.containercontrolplanejava.store.ConflictException;
 import com.github.lechandonga.containercontrolplanejava.store.WorkloadStore;
@@ -25,20 +28,25 @@ public class ControlPlaneService {
     private final Reconciler reconciler;
     private final ControlLoop controlLoop;
     private final EventLog eventLog;
+    private final LocalStateStore localStateStore;
 
     public ControlPlaneService(WorkloadStore store, NodeRegistry nodeRegistry,
-                               Reconciler reconciler, ControlLoop controlLoop, EventLog eventLog) {
+                               Reconciler reconciler, ControlLoop controlLoop, EventLog eventLog,
+                               LocalStateStore localStateStore) {
         this.store = store;
         this.nodeRegistry = nodeRegistry;
         this.reconciler = reconciler;
         this.controlLoop = controlLoop;
         this.eventLog = eventLog;
+        this.localStateStore = localStateStore;
     }
 
     public Workload createWorkload(String uid, WorkloadSpec spec) {
         Workload wl = store.create(uid, spec);
         eventLog.record(EventLog.BUSINESS_LIFECYCLE, uid, "Created",
                 "提交期望状态: replicas=" + spec.replicas() + " image=" + spec.image());
+        eventLog.record(EventLog.BUSINESS_RELEASE, uid, "RevisionOpened",
+                "修订 r1 创建（CREATE）: replicas=" + spec.replicas() + " image=" + spec.image());
         reconciler.reconcile(uid);
         return wl;
     }
@@ -52,12 +60,56 @@ public class ControlPlaneService {
             eventLog.record(EventLog.BUSINESS_LIFECYCLE, uid, "SpecUpdated",
                     "期望状态变更，generation=" + result.workload().getGeneration()
                             + " replicas=" + spec.replicas() + " image=" + spec.image());
+            Revision head = result.workload().headRevision();
+            eventLog.record(EventLog.BUSINESS_RELEASE, uid, "RevisionOpened",
+                    "修订 r" + result.workload().getGeneration()
+                            + " 创建（UPDATE）: 变更前 replicas=" + head.getBefore().replicas()
+                            + " image=" + head.getBefore().image()
+                            + " -> 变更后 replicas=" + head.getAfter().replicas()
+                            + " image=" + head.getAfter().image());
         } else {
             eventLog.record(EventLog.BUSINESS_LIFECYCLE, uid, "SpecSubmittedNoop",
                     "重复提交：期望状态与当前一致，幂等忽略，generation 不变");
         }
         reconciler.reconcile(uid);
         return result.workload();
+    }
+
+    /**
+     * 按修订回滚。{@code targetRevision} 为 null 表示“退回上一个修订”。
+     * 并发保护、重复请求幂等、修订留痕规则全部与普通更新一致（由存储层保证）。
+     */
+    public Workload rollback(String uid, Long targetRevision, String expectedResourceVersion) {
+        WorkloadStore.RollbackResult result =
+                store.rollback(uid, targetRevision, expectedResourceVersion);
+        Revision head = result.workload().headRevision();
+        if (result.changed()) {
+            eventLog.record(EventLog.BUSINESS_RELEASE, uid, "RollbackRequested",
+                    "修订 r" + result.workload().getGeneration()
+                            + " 创建（ROLLBACK）: 回到 r" + result.targetRevision().getRevision()
+                            + " 声明的 replicas=" + head.getAfter().replicas()
+                            + " image=" + head.getAfter().image()
+                            + "，作为一条新修订走正常滚动过程");
+        } else {
+            eventLog.record(EventLog.BUSINESS_RELEASE, uid, "RollbackNoop",
+                    "重复回滚请求：目标修订 r" + result.targetRevision().getRevision()
+                            + " 的声明与当前期望一致，幂等忽略，不产生修订");
+        }
+        reconciler.reconcile(uid);
+        return result.workload();
+    }
+
+    public java.util.List<Revision> listRevisions(String uid) {
+        return store.get(uid).getRevisions();
+    }
+
+    public Revision getRevision(String uid, long revisionNumber) {
+        Revision revision = store.get(uid).findRevision(revisionNumber);
+        if (revision == null) {
+            throw new com.github.lechandonga.containercontrolplanejava.store.NotFoundException(
+                    "工作负载 " + uid + " 的修订 " + revisionNumber);
+        }
+        return revision;
     }
 
     public Workload get(String uid) {
@@ -115,5 +167,21 @@ public class ControlPlaneService {
     /** 供测试模拟控制面重启。 */
     public void restartControlPlane() {
         controlLoop.restartReconciliation();
+    }
+
+    /**
+     * 模拟真实“进程停掉再拉起来”：内存权威状态全部丢弃，仅从本地磁盘文件恢复，
+     * 随后从中断处继续全量调谐。
+     */
+    public void restartProcessFromDisk() {
+        eventLog.record(EventLog.BUSINESS_RECOVERY, "-", "ProcessRestart",
+                "模拟进程重启：丢弃全部内存状态，仅从本地文件恢复期望状态、发布历史与进行中进度");
+        localStateStore.simulateProcessRestart();
+        reconciler.reconcileAll();
+    }
+
+    /** 测试用：下一次状态落盘模拟“写到一半被强杀”。 */
+    public void armKillDuringNextWrite() {
+        localStateStore.armKillDuringNextWrite();
     }
 }

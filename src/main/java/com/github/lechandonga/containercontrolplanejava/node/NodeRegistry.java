@@ -51,6 +51,20 @@ public class NodeRegistry {
         seq.set(0);
     }
 
+    /** 仅供进程重启恢复：按磁盘上的权威登记信息重建节点（uid 保持稳定）。 */
+    public SimulatedNode restoreNode(String uid, String host, int capacity,
+                                    NodeState state, java.time.Instant lastHeartbeat,
+                                    java.util.Map<String, String> containers) {
+        NodeInfo info = new NodeInfo(uid, host, capacity, lastHeartbeat);
+        info.setState(state);
+        SimulatedNode node = new SimulatedNode(info);
+        node.restoreContainers(containers);
+        nodes.put(uid, node);
+        long suffix = Long.parseLong(uid.substring("node-".length()));
+        seq.updateAndGet(current -> Math.max(current, suffix));
+        return node;
+    }
+
     /** 节点上报心跳；被分区的节点无法上报。返回 false 表示心跳未被接受。 */
     public boolean heartbeat(String uid) {
         SimulatedNode node = nodes.get(uid);

@@ -18,6 +18,8 @@ public class EventLog {
     public static final String BUSINESS_CONFLICT = "CONCURRENT_CONFLICT";
     public static final String BUSINESS_CAPACITY = "CAPACITY";
     public static final String BUSINESS_LIFECYCLE = "LIFECYCLE";
+    public static final String BUSINESS_RELEASE = "RELEASE_HISTORY";
+    public static final String BUSINESS_RECOVERY = "RECOVERY";
 
     private static final int MAX_EVENTS = 2000;
 

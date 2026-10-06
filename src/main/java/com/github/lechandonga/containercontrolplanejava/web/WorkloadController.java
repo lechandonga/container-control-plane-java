@@ -6,6 +6,8 @@ import com.github.lechandonga.containercontrolplanejava.model.WorkloadSpec;
 import com.github.lechandonga.containercontrolplanejava.store.NotFoundException;
 import com.github.lechandonga.containercontrolplanejava.web.dto.EventView;
 import com.github.lechandonga.containercontrolplanejava.web.dto.InstanceView;
+import com.github.lechandonga.containercontrolplanejava.web.dto.RevisionView;
+import com.github.lechandonga.containercontrolplanejava.web.dto.RollbackRequest;
 import com.github.lechandonga.containercontrolplanejava.web.dto.WorkloadRequest;
 import com.github.lechandonga.containercontrolplanejava.web.dto.WorkloadView;
 import com.github.lechandonga.containercontrolplanejava.event.EventLog;
@@ -85,5 +87,27 @@ public class WorkloadController {
     @GetMapping("/{uid}/events")
     public List<EventView> events(@PathVariable String uid) {
         return eventLog.byWorkload(uid).stream().map(EventView::from).toList();
+    }
+
+    /** 发布历史：列出该工作负载全部修订（按修订号升序，终态可解释）。 */
+    @GetMapping("/{uid}/revisions")
+    public List<RevisionView> revisions(@PathVariable String uid) {
+        return RevisionView.list(service.listRevisions(uid));
+    }
+
+    /** 查看单条修订。 */
+    @GetMapping("/{uid}/revisions/{revision}")
+    public RevisionView revision(@PathVariable String uid, @PathVariable long revision) {
+        return RevisionView.from(service.getRevision(uid, revision));
+    }
+
+    /**
+     * 按修订回滚：请求体 {"revision": 2, "resourceVersion": "rv-.."}；
+     * revision 省略/null 表示“退回上一个修订”。回滚本身作为一条新修订留痕。
+     */
+    @PostMapping("/{uid}/rollback")
+    public WorkloadView rollback(@PathVariable String uid, @RequestBody RollbackRequest request) {
+        return WorkloadView.from(
+                service.rollback(uid, request.revision(), request.resourceVersion()));
     }
 }
